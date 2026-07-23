@@ -203,10 +203,17 @@ def _should_skip_claude_compat_under_grok(raw: dict[str, Any] | None) -> bool:
         return False
 
 
-def _should_suppress_duplicate_push(event_type: str, title: str, window_sec: float = 12.0) -> bool:
-    """Suppress a second Bark push for the same event_type within a short window.
+def _should_suppress_duplicate_push(
+    event_type: str,
+    title: str,
+    agent: str = "",
+    window_sec: float = 12.0,
+) -> bool:
+    """Suppress a second Bark push for the same logical event within a short window.
 
     Covers residual double-fires (Claude-compat + Grok, or Stop + SessionEnd).
+    Does **not** suppress different agents finishing real work close together
+    (e.g. Claude then Gemini), except the Claude↔Grok dual-hook pair.
     """
     if event_type not in (
         "task_done",
@@ -220,6 +227,7 @@ def _should_suppress_duplicate_push(event_type: str, title: str, window_sec: flo
         last = state.get("last_push") or {}
         last_type = last.get("event_type")
         last_ts = last.get("timestamp")
+        last_agent = str(last.get("agent") or "")
         if last_type != event_type or not last_ts:
             return False
         from datetime import datetime, timezone
@@ -231,27 +239,37 @@ def _should_suppress_duplicate_push(event_type: str, title: str, window_sec: flo
         if prev.tzinfo is None:
             prev = prev.replace(tzinfo=timezone.utc)
         delta = abs((now - prev).total_seconds())
-        if delta <= window_sec:
-            # Same logical card (ignore [Agent] prefix differences).
-            last_title = str(last.get("title") or "")
-            def _strip(t: str) -> str:
-                t = t.strip()
-                if t.startswith("[") and "]" in t:
-                    t = t.split("]", 1)[1].strip()
-                return t
-            if _strip(last_title) == _strip(title) or event_type == "task_done":
-                return True
+        if delta > window_sec:
+            return False
+
+        def _strip(t: str) -> str:
+            t = t.strip()
+            if t.startswith("[") and "]" in t:
+                t = t.split("]", 1)[1].strip()
+            return t
+
+        last_title = str(last.get("title") or "")
+        # Same agent re-fire (Stop + SessionEnd, or hook delivered twice).
+        if last_agent and agent and last_agent == agent:
+            return True
+        # Claude-compat + Grok native dual path.
+        if {last_agent, agent} <= {"claude", "grok"} and len({last_agent, agent}) == 2:
+            return True
+        # Same card text after stripping [Agent] prefix.
+        if _strip(last_title) == _strip(title) and _strip(title):
+            return True
         return False
     except Exception:
         return False
 
 
-def _record_push(event_type: str, title: str) -> None:
+def _record_push(event_type: str, title: str, agent: str = "") -> None:
     try:
         state = load_state()
         state["last_push"] = {
             "event_type": event_type,
             "title": title,
+            "agent": agent,
             "timestamp": timestamp_iso(),
         }
         save_state(state)
@@ -445,7 +463,11 @@ def cmd_hook(event_name: str, agent: str = "claude") -> None:
         # Decide whether to notify (respect Away / DND schedule).
         notified = should_send_notification(final_type, npolicy) and not away_suppresses(final_type, config)
         deduped = False
-        if notified and final_type != "info" and _should_suppress_duplicate_push(final_type, msg["title"]):
+        if (
+            notified
+            and final_type != "info"
+            and _should_suppress_duplicate_push(final_type, msg["title"], agent=agent)
+        ):
             notified = False
             deduped = True
             print(
@@ -475,7 +497,7 @@ def cmd_hook(event_name: str, agent: str = "claude") -> None:
         if notified and final_type != "info":
             ok = dispatch(msg["title"], msg["body"], nc)
             if ok:
-                _record_push(final_type, msg["title"])
+                _record_push(final_type, msg["title"], agent=agent)
 
     except Exception as exc:
         print(f"[AgentWatch] ERROR in hook processing: {exc}", file=sys.stderr, flush=True)
