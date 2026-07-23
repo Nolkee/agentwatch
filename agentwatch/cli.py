@@ -158,13 +158,8 @@ def cmd_test_push() -> None:
         raise SystemExit(1)
 
 
-def _running_under_grok() -> bool:
-    """True when this process was spawned as a Grok Build lifecycle hook.
-
-    Grok also scans ~/.claude/settings.json for Claude-compatible hooks, so the
-    same Stop event would otherwise fire both --agent claude and --agent grok
-    and push two Bark notifications.
-    """
+def _running_under_grok_env() -> bool:
+    """True when Grok injects its reserved hook environment variables."""
     env = os.environ
     return bool(
         env.get("GROK_SESSION_ID")
@@ -172,6 +167,96 @@ def _running_under_grok() -> bool:
         or env.get("GROK_HOOK_NAME")
         or env.get("GROK_WORKSPACE_ROOT")
     )
+
+
+def _payload_from_grok(raw: dict[str, Any] | None) -> bool:
+    """Detect Grok hook stdin envelopes (Claude-compat path may omit GROK_* env).
+
+    Grok's payload uses camelCase fields such as workspaceRoot / sessionCrons /
+    stopHookActive, and transcript paths under ~/.grok/sessions/.
+    """
+    if not isinstance(raw, dict) or not raw:
+        return False
+    if raw.get("sessionCrons") is not None or raw.get("backgroundTasks") is not None:
+        return True
+    if raw.get("workspaceRoot"):
+        return True
+    tp = str(raw.get("transcriptPath") or raw.get("transcript_path") or "")
+    if "/.grok/sessions" in tp or "%2F.grok%2F" in tp or "/.grok/" in tp:
+        return True
+    # Grok camelCase stop / tool envelope
+    if "hookEventName" in raw and (
+        "stopHookActive" in raw or "permissionMode" in raw or "promptId" in raw
+    ):
+        return True
+    return False
+
+
+def _should_skip_claude_compat_under_grok(raw: dict[str, Any] | None) -> bool:
+    """Skip --agent claude when Grok also runs the native Grok agentwatch hooks."""
+    if not (_running_under_grok_env() or _payload_from_grok(raw)):
+        return False
+    try:
+        from agentwatch.agents import grok_status
+        return bool(grok_status().get("installed"))
+    except Exception:
+        return False
+
+
+def _should_suppress_duplicate_push(event_type: str, title: str, window_sec: float = 12.0) -> bool:
+    """Suppress a second Bark push for the same event_type within a short window.
+
+    Covers residual double-fires (Claude-compat + Grok, or Stop + SessionEnd).
+    """
+    if event_type not in (
+        "task_done",
+        "permission_required",
+        "attention_required",
+        "possible_permission_wait",
+    ):
+        return False
+    try:
+        state = load_state()
+        last = state.get("last_push") or {}
+        last_type = last.get("event_type")
+        last_ts = last.get("timestamp")
+        if last_type != event_type or not last_ts:
+            return False
+        from datetime import datetime, timezone
+        try:
+            prev = datetime.fromisoformat(str(last_ts).replace("Z", "+00:00"))
+        except Exception:
+            return False
+        now = datetime.now(timezone.utc)
+        if prev.tzinfo is None:
+            prev = prev.replace(tzinfo=timezone.utc)
+        delta = abs((now - prev).total_seconds())
+        if delta <= window_sec:
+            # Same logical card (ignore [Agent] prefix differences).
+            last_title = str(last.get("title") or "")
+            def _strip(t: str) -> str:
+                t = t.strip()
+                if t.startswith("[") and "]" in t:
+                    t = t.split("]", 1)[1].strip()
+                return t
+            if _strip(last_title) == _strip(title) or event_type == "task_done":
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _record_push(event_type: str, title: str) -> None:
+    try:
+        state = load_state()
+        state["last_push"] = {
+            "event_type": event_type,
+            "title": title,
+            "timestamp": timestamp_iso(),
+        }
+        save_state(state)
+    except Exception:
+        pass
 
 
 def cmd_hook(event_name: str, agent: str = "claude") -> None:
@@ -185,37 +270,35 @@ def cmd_hook(event_name: str, agent: str = "claude") -> None:
     PostToolUse: clears matching pending actions.
     """
     try:
-        from agentwatch.agents import agent_display, grok_status, normalize_event_name
+        from agentwatch.agents import agent_display, normalize_event_name
 
         agent = (agent or "claude").lower()
         canonical = normalize_event_name(event_name)
+        raw = read_stdin_json()
 
         # Grok loads both ~/.grok/hooks and ~/.claude/settings.json. When the
         # dedicated Grok hooks are installed, ignore the Claude-compat copy so
         # the user only gets one [Grok] notification per event.
-        if agent == "claude" and _running_under_grok():
-            try:
-                grok_installed = bool(grok_status().get("installed"))
-            except Exception:
-                grok_installed = False
-            if grok_installed:
-                if canonical in (
-                    "Stop",
-                    "Notification",
-                    "PermissionRequest",
-                    "PermissionDenied",
-                    "SessionEnd",
-                ):
-                    print(
-                        "[AgentWatch] Skip Claude-compat hook under Grok "
-                        "(native Grok hooks already handle this event).",
-                        flush=True,
-                    )
-                raise SystemExit(0)
+        # Note: Claude-compat invocations may omit GROK_* env vars — detect via
+        # stdin payload as well.
+        if agent == "claude" and _should_skip_claude_compat_under_grok(raw):
+            if canonical in (
+                "Stop",
+                "Notification",
+                "PermissionRequest",
+                "PermissionDenied",
+                "SessionEnd",
+            ):
+                print(
+                    "[AgentWatch] Skip Claude-compat hook under Grok "
+                    "(native Grok hooks already handle this event).",
+                    flush=True,
+                )
+            raise SystemExit(0)
+        if agent == "claude" and _payload_from_grok(raw) and not _should_skip_claude_compat_under_grok(raw):
             # Only Claude hooks installed: keep handling, but label as Grok.
             agent = "grok"
 
-        raw = read_stdin_json()
         parsed = parse_event(raw, canonical, agent=agent)
         category = classify(parsed)
 
@@ -361,6 +444,15 @@ def cmd_hook(event_name: str, agent: str = "claude") -> None:
 
         # Decide whether to notify (respect Away / DND schedule).
         notified = should_send_notification(final_type, npolicy) and not away_suppresses(final_type, config)
+        deduped = False
+        if notified and final_type != "info" and _should_suppress_duplicate_push(final_type, msg["title"]):
+            notified = False
+            deduped = True
+            print(
+                f"[AgentWatch/{label}] Suppress duplicate push "
+                f"({final_type} within debounce window).",
+                flush=True,
+            )
 
         log_entry = {
             "timestamp": parsed.get("timestamp", timestamp_iso()),
@@ -372,6 +464,7 @@ def cmd_hook(event_name: str, agent: str = "claude") -> None:
             "risk": (danger_info or drift_info or failure_info or {}).get("risk", "低"),
             "suggestion": (danger_info or drift_info or failure_info or {}).get("suggestion", ""),
             "notified": notified,
+            "deduped": deduped,
             "notification_mode": notification_mode,
             "source": source,
             "persona_theme": (config.get("persona", {}) or {}).get("theme", "off") if (config.get("persona", {}) or {}).get("enabled") else "off",
@@ -380,7 +473,9 @@ def cmd_hook(event_name: str, agent: str = "claude") -> None:
         append_event(log_entry)
 
         if notified and final_type != "info":
-            dispatch(msg["title"], msg["body"], nc)
+            ok = dispatch(msg["title"], msg["body"], nc)
+            if ok:
+                _record_push(final_type, msg["title"])
 
     except Exception as exc:
         print(f"[AgentWatch] ERROR in hook processing: {exc}", file=sys.stderr, flush=True)
