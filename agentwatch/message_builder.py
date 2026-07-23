@@ -29,6 +29,7 @@ def build_message(
     failure_info: dict[str, Any] | None = None,
     extra_summary: str = "",
     config: dict[str, Any] | None = None,
+    agent: str | None = None,
 ) -> dict[str, str]:
     """Generate a Watch notification {title, body}.
 
@@ -41,6 +42,8 @@ def build_message(
         Optional tool summary for permission_required body (e.g. "Bash: cd ~/...")
     config : dict | None
         Optional config dict for persona overlay.
+    agent : str | None
+        Optional source agent id; prefixes the title as [Claude]/[Grok]/...
     """
     title = TITLE_MAP.get(event_type, "AgentWatch 提醒")
     body = _build_body(event_type, parsed, danger_info, drift_info, failure_info, extra_summary)
@@ -48,6 +51,14 @@ def build_message(
     # Apply persona overlay if configured.
     if config is not None:
         title, body = apply_persona(event_type, title, body, config)
+
+    # Prefix with agent so multi-CLI users know which tool needs them.
+    agent_id = agent or (parsed or {}).get("agent") or ""
+    if agent_id:
+        from agentwatch.agents import agent_display
+        label = agent_display(str(agent_id))
+        if not title.startswith("["):
+            title = f"[{label}] {title}"
 
     return {"title": title, "body": body}
 
@@ -131,7 +142,13 @@ def _body_attention(parsed: dict[str, Any] | None) -> str:
 def _body_done(parsed: dict[str, Any] | None) -> str:
     raw = parsed or {}
     stop_reason = raw.get("raw_event", {}).get("reason", "") or "当前步骤已结束"
-    return f"Claude Code 当前步骤已结束：{stop_reason}\n风险：低\n建议：回电脑验收或给下一步指示"
+    agent_id = raw.get("agent") or ""
+    if agent_id:
+        from agentwatch.agents import agent_display
+        who = agent_display(str(agent_id))
+    else:
+        who = "Agent"
+    return f"{who} 当前步骤已结束：{stop_reason}\n风险：低\n建议：回电脑验收或给下一步指示"
 
 
 def _body_guard_blocked(danger_info: dict[str, Any] | None) -> str:

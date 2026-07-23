@@ -139,7 +139,7 @@ def cmd_init() -> None:
     print("[AgentWatch] Init complete. Next steps:")
     print("  1. Edit config.json → set notifier.bark_key")
     print("  2. Run 'agentwatch test-push' to verify notifications")
-    print("  3. Run 'bash install_claude_hooks.sh' to wire up Claude Code hooks")
+    print("  3. Run 'agentwatch hooks install' to wire Claude/Grok/Codex/Gemini")
 
 
 def cmd_test_push() -> None:
@@ -158,19 +158,23 @@ def cmd_test_push() -> None:
         raise SystemExit(1)
 
 
-def cmd_hook(event_name: str) -> None:
-    """Claude Code hook entry point.
+def cmd_hook(event_name: str, agent: str = "claude") -> None:
+    """Multi-agent hook entry point (Claude / Grok / Codex / Gemini).
 
     Reads JSON from stdin, parses / classifies / evaluates policy,
     builds a Watch message, pushes via Bark, and logs the event.
-    NEVER exits non-zero — a hook crash must not block Claude Code.
+    NEVER exits non-zero — a hook crash must not block the host agent.
 
     PreToolUse: registers approval candidates and spawns delayed checker.
     PostToolUse: clears matching pending actions.
     """
     try:
+        from agentwatch.agents import agent_display, normalize_event_name
+
+        agent = (agent or "claude").lower()
+        canonical = normalize_event_name(event_name)
         raw = read_stdin_json()
-        parsed = parse_event(raw, event_name)
+        parsed = parse_event(raw, canonical, agent=agent)
         category = classify(parsed)
 
         config = load_config()
@@ -184,7 +188,13 @@ def cmd_hook(event_name: str) -> None:
         # Approval detection config.
         approval_cfg = config.get("approval_detection", {}) or {}
         approval_enabled = approval_cfg.get("enabled", True) and notification_mode == "actionable"
-        candidate_tools = set(approval_cfg.get("candidate_tools", ["Bash", "Edit", "Write", "MultiEdit", "NotebookEdit"]))
+        # Include common tool names across Claude / Grok / Gemini.
+        default_candidates = [
+            "Bash", "Edit", "Write", "MultiEdit", "NotebookEdit",
+            "run_terminal_command", "search_replace", "write",
+            "run_shell_command", "shell", "Shell",
+        ]
+        candidate_tools = set(approval_cfg.get("candidate_tools", default_candidates))
         delay_seconds = approval_cfg.get("delay_seconds", 4)
 
         # Merge active task boundary from state.
@@ -204,8 +214,9 @@ def cmd_hook(event_name: str) -> None:
         drift_info = None
         failure_info = None
         final_type = category
-        source = f"hook_{event_name.lower()}"
+        source = f"{agent}_hook_{canonical.lower()}"
         extra_summary = ""
+        label = agent_display(agent)
 
         if category == "pretooluse":
             raw_text = parsed.get("raw_text", "")
@@ -238,77 +249,82 @@ def cmd_hook(event_name: str) -> None:
                 _hook_diag(f"[AgentWatch] Guard mode DENIED a {danger_info.get('risk')} operation.")
             elif danger_info:
                 final_type = "danger"
-                source = "hook_pretooluse_danger"
+                source = f"{agent}_hook_pretooluse_danger"
             elif drift_info:
                 final_type = "drift"
-                source = "hook_pretooluse_drift"
+                source = f"{agent}_hook_pretooluse_drift"
             else:
                 final_type = "info"
-                source = "hook_pretooluse"
+                source = f"{agent}_hook_pretooluse"
 
             # ── Approval detection ──────────────────────────────────────
-            if not guard_block and approval_enabled and tool_name in candidate_tools:
+            # Match exact names, or treat shell-like tools as candidates.
+            # Skip when guard already denied the call.
+            tool_match = tool_name in candidate_tools or any(
+                t.lower() == tool_name.lower() for t in candidate_tools
+            )
+            if not guard_block and approval_enabled and tool_match:
                 action_id = make_pending_action_id(parsed)
                 summary = extract_tool_summary(parsed)
                 tuid = extract_tool_identity(parsed)
                 add_pending_action(action_id, tool_name, summary, tuid)
-                print(f"[AgentWatch] Approval candidate registered: {tool_name}", flush=True)
-                print(f"[AgentWatch] Waiting {delay_seconds}s to see whether PostToolUse arrives.", flush=True)
-
-                # Spawn detached background checker.
+                print(f"[AgentWatch/{label}] Approval candidate registered: {tool_name}", flush=True)
+                print(f"[AgentWatch/{label}] Waiting {delay_seconds}s for PostToolUse.", flush=True)
                 _spawn_pending_checker(action_id, delay_seconds)
 
         elif category == "posttooluse_error":
             failure_info = evaluate_failure(parsed, failure_policy)
             if failure_info:
                 final_type = "failure"
-                source = "hook_posttooluse_failure"
+                source = f"{agent}_hook_posttooluse_failure"
             else:
                 final_type = "info"
-                source = "hook_posttooluse_error"
+                source = f"{agent}_hook_posttooluse_error"
 
         elif category == "posttooluse":
             from agentwatch.store import reset_failure_count
             reset_failure_count()
             final_type = "info"
-            source = "hook_posttooluse"
+            source = f"{agent}_hook_posttooluse"
 
-            # ── Clear pending approval ──────────────────────────────────
             tuid = extract_tool_identity(parsed)
             tool_name = parsed.get("tool_name", "")
             cleared = clear_pending_action_by_match(tuid, tool_name)
             if cleared:
-                print(f"[AgentWatch] Approval candidate cleared by PostToolUse: {cleared}", flush=True)
+                print(f"[AgentWatch/{label}] Approval candidate cleared: {cleared}", flush=True)
 
-        elif event_name == "PermissionRequest":
+        elif canonical == "PermissionRequest":
             final_type = "permission_required"
-            source = "hook_permission_request"
-            print(f"[AgentWatch] PermissionRequest received — pushing notification.", flush=True)
+            source = f"{agent}_hook_permission_request"
+            print(f"[AgentWatch/{label}] PermissionRequest — pushing.", flush=True)
 
-        elif event_name == "PermissionDenied":
+        elif canonical == "PermissionDenied":
             final_type = "permission_denied"
-            source = "hook_permission_denied"
-            print(f"[AgentWatch] PermissionDenied received — logging only.", flush=True)
+            source = f"{agent}_hook_permission_denied"
+            print(f"[AgentWatch/{label}] PermissionDenied — log only.", flush=True)
 
         elif category in ("permission_required", "attention_required"):
             final_type = category
-            source = "hook_notification"
+            source = f"{agent}_hook_notification"
 
         elif category == "task_done":
             final_type = category
-            source = "hook_stop"
+            source = f"{agent}_hook_stop"
 
-        # Build message.
-        msg = build_message(final_type, parsed, danger_info, drift_info, failure_info, config=config)
+        # Build message (title includes [Agent] prefix).
+        msg = build_message(
+            final_type, parsed, danger_info, drift_info, failure_info,
+            config=config, agent=agent,
+        )
 
-        # Decide whether to notify.
+        # Decide whether to notify (respect Away / DND schedule).
         notified = should_send_notification(final_type, npolicy) and not away_suppresses(final_type, config)
 
-        # Build log entry.
         log_entry = {
             "timestamp": parsed.get("timestamp", timestamp_iso()),
-            "event_name": event_name,
+            "event_name": canonical,
             "event_type": final_type,
+            "agent": agent,
             "title": msg["title"],
             "body": msg["body"],
             "risk": (danger_info or drift_info or failure_info or {}).get("risk", "低"),
@@ -328,6 +344,86 @@ def cmd_hook(event_name: str) -> None:
         print(f"[AgentWatch] ERROR in hook processing: {exc}", file=sys.stderr, flush=True)
 
     raise SystemExit(0)
+
+
+def cmd_hooks_status() -> None:
+    """Show hook install status for all supported agents."""
+    from agentwatch.agents import status_all
+
+    print()
+    print(f"{_ansi('bold')}{_ansi('cyan')}AgentWatch Hooks Status{_ansi('reset')}")
+    print()
+    for st in status_all():
+        name = st.get("display", st.get("agent", "?"))
+        if not st.get("available"):
+            print(f"  {name:<8} {_ansi('dim')}not detected{_ansi('reset')}")
+            continue
+        if st.get("installed"):
+            print(
+                f"  {name:<8} {_ansi('green')}Installed{_ansi('reset')}  "
+                f"({st.get('hook_count', 0)}/{st.get('required', '?')} events)  "
+                f"{_ansi('dim')}{st.get('config_path', '')}{_ansi('reset')}"
+            )
+        else:
+            print(
+                f"  {name:<8} {_ansi('yellow')}Not installed{_ansi('reset')}  "
+                f"({st.get('hook_count', 0)}/{st.get('required', '?')})  "
+                f"{_ansi('dim')}{st.get('config_path', '')}{_ansi('reset')}"
+            )
+    print()
+    print("  Install: agentwatch hooks install")
+    print("  Partial: agentwatch hooks install --agent grok,codex,gemini")
+    print()
+
+
+def cmd_hooks_install(agents_csv: str = "") -> None:
+    """Install hooks for one or more agents (default: all)."""
+    from agentwatch.agents import AGENT_IDS, install_agents
+
+    if agents_csv.strip():
+        agents = [a.strip().lower() for a in agents_csv.split(",") if a.strip()]
+    else:
+        agents = list(AGENT_IDS)
+
+    print()
+    print(f"[AgentWatch] Installing hooks for: {', '.join(agents)}")
+    results = install_agents(agents)
+    for st in results:
+        name = st.get("display", st.get("agent", "?"))
+        if st.get("error"):
+            print(f"  {name}: {_ansi('red')}FAILED{_ansi('reset')} — {st['error']}")
+            continue
+        status = "Installed" if st.get("installed") else f"Partial ({st.get('hook_count', 0)}/{st.get('required', '?')})"
+        color = "green" if st.get("installed") else "yellow"
+        print(f"  {name}: {_ansi(color)}{status}{_ansi('reset')} → {st.get('config_path', '')}")
+        if st.get("backup"):
+            print(f"         backup: {st['backup']}")
+    print()
+    print("[AgentWatch] Restart each CLI session so new hooks load.")
+    print()
+
+
+def cmd_hooks_uninstall(agents_csv: str = "") -> None:
+    """Remove AgentWatch hooks from one or more agents."""
+    from agentwatch.agents import AGENT_IDS, uninstall_agents
+
+    if agents_csv.strip():
+        agents = [a.strip().lower() for a in agents_csv.split(",") if a.strip()]
+    else:
+        agents = list(AGENT_IDS)
+
+    print()
+    print(f"[AgentWatch] Uninstalling hooks for: {', '.join(agents)}")
+    results = uninstall_agents(agents)
+    for st in results:
+        name = st.get("display", st.get("agent", "?"))
+        if st.get("error"):
+            print(f"  {name}: {_ansi('red')}FAILED{_ansi('reset')} — {st['error']}")
+        elif st.get("installed"):
+            print(f"  {name}: {_ansi('yellow')}still present{_ansi('reset')}")
+        else:
+            print(f"  {name}: {_ansi('green')}removed{_ansi('reset')}")
+    print()
 
 
 def _spawn_pending_checker(action_id: str, delay_seconds: int) -> None:
@@ -726,39 +822,43 @@ def cmd_simulate(args: argparse.Namespace) -> None:
 
 
 def _check_hooks_readonly() -> str:
-    """Check whether agentwatch hooks are present in ~/.claude/settings.json.
-
-    Only *reads* the file — never modifies it.
-    """
-    if not _CLAUDE_SETTINGS.exists():
-        return "Not detected (no settings file)"
+    """Check Claude hooks (legacy single-status used by monitor header)."""
     try:
-        with open(_CLAUDE_SETTINGS, "r", encoding="utf-8") as fh:
-            settings = json.load(fh)
+        from agentwatch.agents import claude_status
+        st = claude_status()
+        if st.get("installed"):
+            return "Installed"
+        if st.get("hook_count", 0) >= 4:
+            return "Partial (missing PermissionRequest)"
+        if st.get("hook_count", 0) > 0:
+            return f"Partial ({st['hook_count']}/6)"
+        return "Not installed"
     except Exception:
-        return "Not detected (unparseable settings)"
+        return "Not installed"
 
-    hooks = settings.get("hooks", {}) or {}
-    found: list[str] = []
-    for event_name in ["PreToolUse", "PostToolUse", "Notification", "Stop", "PermissionRequest", "PermissionDenied"]:
-        groups = hooks.get(event_name, [])
-        for g in groups:
-            inner = g.get("hooks", []) if isinstance(g, dict) else []
-            for h in inner:
-                if isinstance(h, dict) and "agentwatch" in h.get("command", ""):
-                    found.append(event_name)
-                    break
-            else:
-                continue
-            break
 
-    if len(found) >= 6:
-        return "Installed"
-    if len(found) >= 4:
-        return f"Partial (missing PermissionRequest)"
-    if found:
-        return f"Partial ({len(found)}/6)"
-    return "Not installed"
+def _format_multi_hooks_summary() -> tuple[str, int]:
+    """Return (summary_line, issues_count) for multi-agent hooks."""
+    from agentwatch.agents import status_all
+
+    parts = []
+    issues = 0
+    any_available = False
+    for st in status_all():
+        if not st.get("available"):
+            continue
+        any_available = True
+        label = {"claude": "Claude", "grok": "Grok", "codex": "Codex", "gemini": "Gemini"}.get(
+            st.get("agent"), st.get("display", "?")
+        )
+        if st.get("installed"):
+            parts.append(f"{label}✓")
+        else:
+            parts.append(f"{label}✗")
+            issues += 1
+    if not any_available:
+        return "No agents detected", 1
+    return " ".join(parts), issues
 
 
 def cmd_doctor() -> int:
@@ -816,20 +916,29 @@ def cmd_doctor() -> int:
     else:
         print(f"  Logs:        {_ansi('yellow')}No events yet{_ansi('reset')}")
 
-    # Claude hooks (read-only check)
-    hook_status = _check_hooks_readonly()
-    if hook_status == "Installed":
-        print(f"  Claude hooks:{_ansi('green')}Installed{_ansi('reset')}")
-    elif "missing PermissionRequest" in hook_status:
-        print(f"  Claude hooks:{_ansi('yellow')}Missing PermissionRequest{_ansi('reset')}")
-        print(f"               Run install script again to add PermissionRequest/PermissionDenied hooks.")
-        issues += 1
-    elif hook_status.startswith("Partial"):
-        print(f"  Claude hooks:{_ansi('yellow')}{hook_status}{_ansi('reset')}")
-        issues += 1
-    else:
-        print(f"  Claude hooks:{_ansi('yellow')}{hook_status}{_ansi('reset')}")
-        print(f"               Run: bash install_claude_hooks.sh")
+    # Multi-agent hooks (read-only check)
+    from agentwatch.agents import status_all
+
+    print(f"  Hooks:")
+    hook_issues = 0
+    for st in status_all():
+        name = st.get("display", st.get("agent", "?"))
+        if not st.get("available"):
+            print(f"    {name:<8}{_ansi('dim')}not detected{_ansi('reset')}")
+            continue
+        if st.get("installed"):
+            print(
+                f"    {name:<8}{_ansi('green')}Installed{_ansi('reset')} "
+                f"({st.get('hook_count', 0)}/{st.get('required', '?')})"
+            )
+        else:
+            print(
+                f"    {name:<8}{_ansi('yellow')}Not installed{_ansi('reset')} "
+                f"({st.get('hook_count', 0)}/{st.get('required', '?')})"
+            )
+            hook_issues += 1
+    if hook_issues:
+        print(f"               Run: agentwatch hooks install")
         issues += 1
 
     # Active task
@@ -897,12 +1006,16 @@ def _render_monitor(config: dict[str, Any], issues: int) -> str:
     # Status block
     nc = get_notifier_config(config)
     bark_ok = bool(nc.get("bark_key", "") and nc["bark_key"] != "YOUR_BARK_KEY")
-    hook_status = _check_hooks_readonly()
-    hooks_ok = hook_status == "Installed"
+    hooks_summary, hook_issues = _format_multi_hooks_summary()
+    hooks_ok = hook_issues == 0
 
     lines.append(f"  {b}Status:{r}")
     lines.append(f"    Bark:         {g}OK{r}" if bark_ok else f"    Bark:         {y}NOT CONFIGURED{r}")
-    lines.append(f"    Hooks:        {g}{hook_status}{r}" if hooks_ok else f"    Hooks:        {y}{hook_status}{r}")
+    lines.append(
+        f"    Hooks:        {g}{hooks_summary}{r}"
+        if hooks_ok
+        else f"    Hooks:        {y}{hooks_summary}{r}"
+    )
 
     state = load_state()
     task = state.get("active_task")
@@ -964,8 +1077,8 @@ def cmd_monitor() -> None:
             # Re-count issues each loop so status is live.
             nc = get_notifier_config(config)
             bark_ok = bool(nc.get("bark_key", "") and nc["bark_key"] != "YOUR_BARK_KEY")
-            hooks_ok = _check_hooks_readonly() == "Installed"
-            issues = 0 if (bark_ok and hooks_ok) else 1
+            _, hook_issues = _format_multi_hooks_summary()
+            issues = 0 if (bark_ok and hook_issues == 0) else 1
 
             display = _render_monitor(config, issues)
             sys.stdout.write(display)
@@ -1356,8 +1469,35 @@ def build_parser() -> argparse.ArgumentParser:
     away_sub.add_parser("status", help="Show Away mode status (default)")
 
     # hook
-    p_hook = sub.add_parser("hook", help="Claude Code hook entry point (called by hooks)")
-    p_hook.add_argument("--event", required=True, choices=["PreToolUse", "PostToolUse", "Notification", "Stop", "PermissionRequest", "PermissionDenied"])
+    p_hook = sub.add_parser("hook", help="Multi-agent hook entry point (called by CLI hooks)")
+    p_hook.add_argument(
+        "--event",
+        required=True,
+        help="Lifecycle event name (Claude/Grok/Codex or Gemini aliases)",
+    )
+    p_hook.add_argument(
+        "--agent",
+        default="claude",
+        choices=["claude", "grok", "codex", "gemini"],
+        help="Source agent (default: claude)",
+    )
+
+    # hooks (install / status / uninstall for multi-agent)
+    p_hooks = sub.add_parser("hooks", help="Install / status / uninstall multi-agent hooks")
+    hooks_sub = p_hooks.add_subparsers(dest="hooks_cmd")
+    hooks_sub.add_parser("status", help="Show hook status for Claude/Grok/Codex/Gemini")
+    p_hooks_install = hooks_sub.add_parser("install", help="Install hooks (all agents by default)")
+    p_hooks_install.add_argument(
+        "--agent",
+        default="",
+        help="Comma-separated agents: claude,grok,codex,gemini (default: all)",
+    )
+    p_hooks_uninstall = hooks_sub.add_parser("uninstall", help="Remove AgentWatch hooks")
+    p_hooks_uninstall.add_argument(
+        "--agent",
+        default="",
+        help="Comma-separated agents (default: all)",
+    )
 
     # task
     p_task = sub.add_parser("task", help="Manage task boundaries")
@@ -1438,7 +1578,16 @@ def main() -> None:
     elif args.command == "away":
         cmd_away(args)
     elif args.command == "hook":
-        cmd_hook(args.event)
+        cmd_hook(args.event, agent=getattr(args, "agent", "claude"))
+    elif args.command == "hooks":
+        if args.hooks_cmd == "status":
+            cmd_hooks_status()
+        elif args.hooks_cmd == "install":
+            cmd_hooks_install(getattr(args, "agent", "") or "")
+        elif args.hooks_cmd == "uninstall":
+            cmd_hooks_uninstall(getattr(args, "agent", "") or "")
+        else:
+            parser.parse_args(["hooks", "--help"])
     elif args.command == "task":
         if args.task_cmd == "start":
             cmd_task_start(args)

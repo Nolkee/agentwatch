@@ -209,11 +209,12 @@ agentwatch init
 agentwatch config bark        # 粘贴完整 Bark URL 或纯 key
 agentwatch config test        # 验证通知链路是否打通
 
-# 安装 Claude Code hooks（手动，一次性）
-bash install_claude_hooks.sh
+# 安装 Claude / Grok / Codex / Gemini hooks（手动，一次性）
+agentwatch hooks install
+# 或仅 Claude（旧方式）：bash install_claude_hooks.sh
 
 # 验证
-agentwatch doctor             # 应显示 "Status: Ready"
+agentwatch doctor             # 应显示各 Agent 的 hooks Installed
 ```
 
 ### 可选：构建 macOS 菜单栏 App
@@ -316,34 +317,53 @@ AgentWatch 通过 [Bark](https://apps.apple.com/app/bark/id1403753865)（免费�
 
 ---
 
-## Claude Code Hooks
+## Agent Hooks（Claude / Grok / Codex / Gemini）
 
-Hooks 是**手动、选择性**的——AgentWatch 不会自动修改你的 Claude Code 配置。安装前会备份 settings.json。
+Hooks 是**手动、选择性**的——只有你主动运行安装命令时才会改各 CLI 配置，安装前会备份。通知标题会带来源前缀，例如 `[Grok] 任务完成`。
 
-六个 Hooks 被注册：
+### 支持的 Agent
 
-| Hook | 触发时机 | AgentWatch 行为 |
-|------|---------|----------------|
+| Agent | 安装写入位置 | 核心事件 |
+|-------|-------------|----------|
+| **Claude Code** | `~/.claude/settings.json` | PreToolUse, PostToolUse, Notification, Stop, PermissionRequest, PermissionDenied |
+| **Grok Build** | `~/.grok/hooks/agentwatch.json` | PreToolUse, PostToolUse, Notification, Stop, SessionEnd, PermissionDenied |
+| **Codex CLI** | `~/.codex/hooks.json`（并启用 `features.hooks`） | PreToolUse, PostToolUse, Notification, Stop, PermissionRequest |
+| **Gemini CLI** | `~/.gemini/settings.json` | BeforeTool, AfterTool, Notification, AfterAgent（内部映射） |
+
+| Hook（规范名） | 触发时机 | AgentWatch 行为 |
+|----------------|---------|----------------|
 | `PreToolUse` | Agent 即将调用工具 | 危险/跑偏检测 + 注册 pending action |
 | `PostToolUse` | Agent 完成工具调用 | 清除 pending action，追踪失败 |
 | `Notification` | Agent 发送通知 | 分类为 attention_required（fallback） |
-| `Stop` | Claude Code 会话结束 | 推送"任务完成"到手表 |
-| `PermissionRequest` | **"Allow this bash command?"弹窗出现** | 推送"需要权限"到手表 |
-| `PermissionDenied` | 用户点击"No"拒绝权限 | 仅记录日志 |
+| `Stop` / 回合结束 | Agent 回合或会话结束 | 推送「任务完成」到手表 |
+| `PermissionRequest` | 权限/确认弹窗 | 推送「需要权限」到手表 |
+| `PermissionDenied` | 用户拒绝操作 | 仅记录日志 |
 
-**macOS：**
+### 安装 / 状态 / 卸载
+
 ```bash
-bash install_claude_hooks.sh     # 安装
-bash uninstall_claude_hooks.sh   # 卸载
+agentwatch hooks install                    # 全部支持的 Agent
+agentwatch hooks install --agent grok,codex # 只装部分
+agentwatch hooks status
+agentwatch hooks uninstall --agent gemini
+agentwatch doctor                           # 按 Agent 显示 hooks 状态
 ```
 
-**Windows：**
-```powershell
+**仅 Claude 的旧脚本**（仍可用）：
+
+```bash
+# macOS
+bash install_claude_hooks.sh
+bash uninstall_claude_hooks.sh
+
+# Windows
 powershell -ExecutionPolicy Bypass -File windows\install_claude_hooks_windows.ps1
 powershell -ExecutionPolicy Bypass -File windows\uninstall_claude_hooks_windows.ps1
 ```
 
-> ⚠️ **升级提醒：** 如果你在 v0.8.0 之前安装了 hooks，需要重新运行安装脚本以添加 `PermissionRequest` 和 `PermissionDenied`。运行 `agentwatch doctor` 应显示 `Claude hooks: Installed`（6/6）。
+> ⚠️ **会话重载：** 安装后请在**每个 CLI 新开会话**（或重载 hooks，例如 Grok 的 `/hooks` → 按 `r`）。Hooks 在 session 启动时加载，已打开的旧会话不会自动生效。
+>
+> ⚠️ **升级提醒：** 若在 v0.8.0 之前装过 Claude hooks，请重新安装以加入 `PermissionRequest` / `PermissionDenied`。
 
 ---
 
@@ -434,7 +454,8 @@ open build/AgentWatch.app        # 启动
 | Test Push | 发送测试通知验证链路 |
 | Persona Theme | 六种主题切换，当前选中带勾选 |
 | Recent Events | 最近 5 条非 info 事件，带图标、时间和 notified/logged 标签 |
-| Hook 状态 | 显示 6 hooks 是否安装完整；缺少 PermissionRequest 时提示 |
+| Hook 状态 | 按 Agent 显示（Claude / Grok / Codex / Gemini） |
+| Install / Update Hooks | 一键安装多 Agent hooks（带确认） |
 | Approval Timeout Notify | 显示 PreToolUse timeout 推送是否开启 |
 | 任务边界 | 管理允许/禁止路径 |
 | 快捷入口 | 打开 Logs 文件夹、config.json、README |
@@ -469,10 +490,13 @@ build\windows\AgentWatchTray\AgentWatchTray.exe
 
 | 命令 | 说明 |
 |------|------|
-| `agentwatch doctor` | 全面健康检查 |
+| `agentwatch doctor` | 全面健康检查（含多 Agent hooks） |
 | `agentwatch monitor` | 实时 ANSI 监控面板（Ctrl+C 退出） |
 | `agentwatch start` | doctor 检查 → monitor 面板 |
 | `agentwatch init` | 创建 config.json 和日志目录 |
+| `agentwatch hooks install` | 安装 Claude / Grok / Codex / Gemini hooks |
+| `agentwatch hooks status` | 查看各 Agent hooks 状态 |
+| `agentwatch hooks uninstall` | 卸载 AgentWatch hooks |
 | `agentwatch config bark` | 设置 Bark key（支持完整 URL 或纯 key） |
 | `agentwatch config show` | 显示 Bark 配置（key 脱敏） |
 | `agentwatch config test` | 发送测试通知 |
@@ -497,7 +521,7 @@ build\windows\AgentWatchTray\AgentWatchTray.exe
 ```bash
 # 1. 健康检查
 agentwatch doctor
-# 预期：Status: Ready，Claude hooks: Installed
+# 预期：Status: Ready；各已检测 Agent 的 hooks 为 Installed
 
 # 2. 测试通知链路
 agentwatch config test

@@ -12,6 +12,7 @@ let kConfigPath    = "\(kProjectPath)/config.json"
 let kEventsLog     = "\(kProjectPath)/logs/agentwatch_events.jsonl"
 let kStateFile     = "\(kProjectPath)/logs/state.json"
 let kClaudeSettings = "\(NSHomeDirectory())/.claude/settings.json"
+let kInstallHooksScript = "\(kProjectPath)/install_claude_hooks.sh" // legacy shell; prefer CLI
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -128,11 +129,22 @@ enum OverallStatus: String {
     }
 }
 
+struct AgentHookStatus {
+    var id: String
+    var display: String
+    var available: Bool
+    var installed: Bool
+    var hookCount: Int
+    var required: Int
+}
+
 struct AppStatus {
     var barkOk: Bool
     var barkDisplay: String        // redacted key
     var hooksInstalled: Bool
-    var hookCount: Int        // number of agentwatch hooks found
+    var hookCount: Int        // number of agentwatch hooks found (claude legacy)
+    var agentHooks: [AgentHookStatus]
+    var hooksSummary: String
     var taskName: String?
     var allowedPaths: [String]
     var forbiddenPaths: [String]
@@ -190,27 +202,18 @@ func readAppStatus() -> AppStatus {
         timeoutWatchNotify = ad["timeout_watch_notify"] as? Bool ?? false
     }
 
-    // --- Hooks (read-only check, never modifies) ---
-    var hooksInstalled = false
-    var hookCount = 0
-    if let settings = readJSON(kClaudeSettings),
-       let hooks = settings["hooks"] as? [String: Any] {
-        let needed = ["PreToolUse", "PostToolUse", "Notification", "Stop", "PermissionRequest", "PermissionDenied"]
-        for eventName in needed {
-            if let groups = hooks[eventName] as? [[String: Any]] {
-                for g in groups {
-                    if let inner = g["hooks"] as? [[String: Any]] {
-                        for h in inner {
-                            if let cmd = h["command"] as? String, cmd.contains("agentwatch") {
-                                hookCount += 1; break
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        hooksInstalled = (hookCount >= 6)
-    }
+    // --- Hooks (multi-agent, read-only) ---
+    let agentHooks = readMultiAgentHookStatus()
+    let availableAgents = agentHooks.filter { $0.available }
+    let installedAgents = availableAgents.filter { $0.installed }
+    let hooksInstalled = !availableAgents.isEmpty && installedAgents.count == availableAgents.count
+    let hookCount = agentHooks.reduce(0) { $0 + $1.hookCount }
+    let hooksSummary: String = {
+        if availableAgents.isEmpty { return "No agents detected" }
+        return availableAgents.map { a in
+            "\(a.display)\(a.installed ? "✓" : "✗")"
+        }.joined(separator: " ")
+    }()
 
     // --- Task ---
     var taskName: String? = nil
@@ -275,6 +278,8 @@ func readAppStatus() -> AppStatus {
         barkDisplay: barkDisplay,
         hooksInstalled: hooksInstalled,
         hookCount: hookCount,
+        agentHooks: agentHooks,
+        hooksSummary: hooksSummary,
         taskName: taskName,
         allowedPaths: allowedPaths,
         forbiddenPaths: forbiddenPaths,
@@ -284,6 +289,80 @@ func readAppStatus() -> AppStatus {
         personaTheme: personaTheme,
         timeoutWatchNotify: timeoutWatchNotify
     )
+}
+
+/// Count agentwatch commands under a Claude-style hooks object for the given event names.
+private func countHooksInObject(_ hooks: [String: Any]?, events: [String]) -> Int {
+    guard let hooks = hooks else { return 0 }
+    var count = 0
+    for eventName in events {
+        guard let groups = hooks[eventName] as? [[String: Any]] else { continue }
+        var hit = false
+        for g in groups {
+            if let inner = g["hooks"] as? [[String: Any]] {
+                for h in inner {
+                    if let cmd = h["command"] as? String, cmd.contains("agentwatch") {
+                        hit = true; break
+                    }
+                }
+            }
+            if hit { break }
+        }
+        if hit { count += 1 }
+    }
+    return count
+}
+
+func readMultiAgentHookStatus() -> [AgentHookStatus] {
+    let home = NSHomeDirectory()
+    var result: [AgentHookStatus] = []
+
+    // Claude
+    let claudeSettings = "\(home)/.claude/settings.json"
+    let claudeEvents = ["PreToolUse", "PostToolUse", "Notification", "Stop", "PermissionRequest", "PermissionDenied"]
+    let claudeHooks = readJSON(claudeSettings)?["hooks"] as? [String: Any]
+    let claudeCount = countHooksInObject(claudeHooks, events: claudeEvents)
+    let claudeAvail = FileManager.default.fileExists(atPath: "\(home)/.claude")
+        || FileManager.default.fileExists(atPath: claudeSettings)
+    result.append(AgentHookStatus(
+        id: "claude", display: "Claude", available: claudeAvail,
+        installed: claudeCount >= 6, hookCount: claudeCount, required: 6
+    ))
+
+    // Grok
+    let grokFile = "\(home)/.grok/hooks/agentwatch.json"
+    let grokEvents = ["PreToolUse", "PostToolUse", "Notification", "Stop", "SessionEnd", "PermissionDenied"]
+    let grokHooks = readJSON(grokFile)?["hooks"] as? [String: Any]
+    let grokCount = countHooksInObject(grokHooks, events: grokEvents)
+    let grokAvail = FileManager.default.fileExists(atPath: "\(home)/.grok")
+    result.append(AgentHookStatus(
+        id: "grok", display: "Grok", available: grokAvail,
+        installed: grokCount >= 4, hookCount: grokCount, required: grokEvents.count
+    ))
+
+    // Codex
+    let codexFile = "\(home)/.codex/hooks.json"
+    let codexEvents = ["PreToolUse", "PostToolUse", "Notification", "Stop", "PermissionRequest"]
+    let codexHooks = readJSON(codexFile)?["hooks"] as? [String: Any]
+    let codexCount = countHooksInObject(codexHooks, events: codexEvents)
+    let codexAvail = FileManager.default.fileExists(atPath: "\(home)/.codex")
+    result.append(AgentHookStatus(
+        id: "codex", display: "Codex", available: codexAvail,
+        installed: codexCount >= 4, hookCount: codexCount, required: codexEvents.count
+    ))
+
+    // Gemini
+    let geminiSettings = "\(home)/.gemini/settings.json"
+    let geminiEvents = ["BeforeTool", "AfterTool", "Notification", "AfterAgent"]
+    let geminiHooks = readJSON(geminiSettings)?["hooks"] as? [String: Any]
+    let geminiCount = countHooksInObject(geminiHooks, events: geminiEvents)
+    let geminiAvail = FileManager.default.fileExists(atPath: "\(home)/.gemini")
+    result.append(AgentHookStatus(
+        id: "gemini", display: "Gemini", available: geminiAvail,
+        installed: geminiCount >= 3, hookCount: geminiCount, required: geminiEvents.count
+    ))
+
+    return result
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -316,7 +395,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // ── Status ──
         addDisabled(menu, "Bark: \(status.barkOk ? "✓ OK" : "✗ \(status.barkDisplay)")")
-        addDisabled(menu, "Hooks: \(status.hooksInstalled ? "✓ Installed" : (status.hookCount >= 4 ? "✗ Missing PermissionRequest" : "✗ Missing"))")
+        addDisabled(menu, "Hooks: \(status.hooksInstalled ? "✓ \(status.hooksSummary)" : "✗ \(status.hooksSummary)")")
+        for a in status.agentHooks where a.available {
+            let mark = a.installed ? "✓" : "✗"
+            addDisabled(menu, "  \(a.display): \(mark) \(a.hookCount)/\(a.required)")
+        }
         addDisabled(menu, "Notif Mode: \(status.notificationMode)")
         addDisabled(menu, "Persona: \(personaDisplayName(status.personaTheme))")
         addDisabled(menu, "Approval Timeout Notify: \(status.timeoutWatchNotify ? "On" : "Off")")
@@ -371,6 +454,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         addAction(menu, "Add / Update Bark Key...", #selector(updateBarkKey))
         addAction(menu, "Show Bark Config",         #selector(showBarkConfig))
         addAction(menu, "Test Push",               #selector(testPush))
+        addAction(menu, "Install / Update Hooks",  #selector(installOrUpdateHooks))
         addAction(menu, "Set Task Boundary...",    #selector(setTaskBoundary))
         addAction(menu, "Clear Task Boundary",     #selector(clearTaskBoundary))
 
@@ -490,6 +574,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc private func installOrUpdateHooks() {
+        let alert = NSAlert()
+        alert.messageText = "Install / Update Hooks"
+        alert.informativeText = """
+        Install AgentWatch hooks for all detected agents:
+
+          • Claude  → ~/.claude/settings.json
+          • Grok    → ~/.grok/hooks/agentwatch.json
+          • Codex   → ~/.codex/hooks.json
+          • Gemini  → ~/.gemini/settings.json
+
+        Existing settings are backed up; non-AgentWatch hooks are preserved.
+
+        After installing, start a new session in each CLI.
+
+        Continue?
+        """
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Install All")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() != .alertFirstButtonReturn { return }
+
+        lastActionResult = "Installing multi-agent hooks..."
+        rebuildMenu()
+
+        DispatchQueue.global().async { [weak self] in
+            // Prefer unified CLI installer (Claude + Grok + Codex + Gemini).
+            let result = callAgentWatch(["hooks", "install"], timeoutSec: 60.0)
+            DispatchQueue.main.async {
+                let ok = (result?.exitCode == 0)
+                let stdout = (result?.stdout ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let stderr = (result?.stderr ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let combined = [stdout, stderr].filter { !$0.isEmpty }.joined(separator: "\n")
+
+                if ok {
+                    let status = readAppStatus()
+                    let lines = status.agentHooks
+                        .filter { $0.available }
+                        .map { "\($0.display): \($0.installed ? "✓" : "✗") \($0.hookCount)/\($0.required)" }
+                        .joined(separator: "\n")
+                    self?.showInfoDialog(
+                        "Hooks Updated",
+                        message: "\(status.hooksSummary)\n\n\(lines)\n\nRestart each CLI session to load hooks."
+                    )
+                    self?.refreshUI(with: status.hooksInstalled
+                        ? "Last: Multi-agent hooks installed ✓"
+                        : "Last: Hooks install finished — some agents incomplete")
+                } else {
+                    let detail = combined.isEmpty ? "Unknown error (exit \(result?.exitCode ?? -1))" : combined
+                    self?.showInfoDialog("Hooks Install Failed", message: detail)
+                    self?.refreshUI(with: "Last: Hooks install failed ✗")
+                }
+            }
+        }
+    }
+
     @objc private func setTaskBoundary() {
         // Open Terminal with agentwatch task quick
         let script = """
@@ -537,7 +677,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         source .venv/bin/activate
         pip install -e .
         agentwatch init
+        agentwatch config bark
         agentwatch test-push
+        agentwatch hooks install
+        agentwatch doctor
         """
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(cmds, forType: .string)

@@ -202,11 +202,12 @@ agentwatch init
 agentwatch config bark        # paste your Bark URL or key
 agentwatch config test        # verify notifications reach your watch
 
-# Install Claude Code hooks (manual, one-time)
-bash install_claude_hooks.sh
+# Install hooks for Claude / Grok / Codex / Gemini (manual, one-time)
+agentwatch hooks install
+# Or Claude-only (legacy): bash install_claude_hooks.sh
 
 # Verify
-agentwatch doctor             # should show "Status: Ready"
+agentwatch doctor             # should show hooks Installed per detected agent
 ```
 
 ### Optional: Build macOS Menu Bar App
@@ -311,34 +312,53 @@ You should receive "AgentWatch Bark 测试" on your phone and wearable device.
 
 ---
 
-## Claude Code Hooks
+## Agent Hooks (Claude / Grok / Codex / Gemini)
 
-Hooks are **manual, opt-in** — AgentWatch never modifies your Claude Code configuration automatically. A backup of `settings.json` is always created before modification.
+Hooks are **manual, opt-in** — AgentWatch never rewrites your CLI configs unless you run the installer. Backups are created before modification. Notification titles are prefixed with the source agent, e.g. `[Grok] 任务完成`.
 
-Six hooks are registered:
+### Supported agents
 
-| Hook | Fires When | AgentWatch Action |
-|------|-----------|-------------------|
+| Agent | Config written by installer | Core events |
+|-------|----------------------------|-------------|
+| **Claude Code** | `~/.claude/settings.json` | PreToolUse, PostToolUse, Notification, Stop, PermissionRequest, PermissionDenied |
+| **Grok Build** | `~/.grok/hooks/agentwatch.json` | PreToolUse, PostToolUse, Notification, Stop, SessionEnd, PermissionDenied |
+| **Codex CLI** | `~/.codex/hooks.json` (+ enables `features.hooks`) | PreToolUse, PostToolUse, Notification, Stop, PermissionRequest |
+| **Gemini CLI** | `~/.gemini/settings.json` | BeforeTool, AfterTool, Notification, AfterAgent (mapped internally) |
+
+| Hook (canonical) | Fires When | AgentWatch Action |
+|------------------|-----------|-------------------|
 | `PreToolUse` | Agent is about to call a tool | Danger/drift detection + register pending action |
 | `PostToolUse` | Agent finishes a tool call | Clear pending action, track failures |
 | `Notification` | Agent sends a notification | Classify as attention_required (fallback) |
-| `Stop` | Claude Code session ends | Push "task done" to watch |
-| `PermissionRequest` | **"Allow this bash command?"** dialog appears | Push "needs permission" to watch |
-| `PermissionDenied` | User clicks "No" on the permission dialog | Log only |
+| `Stop` / turn complete | Agent turn or session ends | Push "task done" to watch |
+| `PermissionRequest` | Permission / approval dialog | Push "needs permission" to watch |
+| `PermissionDenied` | User denies an operation | Log only |
 
-**macOS:**
+### Install / status / uninstall
+
 ```bash
-bash install_claude_hooks.sh     # install
-bash uninstall_claude_hooks.sh   # remove
+agentwatch hooks install                    # all supported agents
+agentwatch hooks install --agent grok,codex # subset
+agentwatch hooks status
+agentwatch hooks uninstall --agent gemini
+agentwatch doctor                           # per-agent hook status
 ```
 
-**Windows:**
-```powershell
+**Legacy Claude-only scripts** (still work):
+
+```bash
+# macOS
+bash install_claude_hooks.sh
+bash uninstall_claude_hooks.sh
+
+# Windows
 powershell -ExecutionPolicy Bypass -File windows\install_claude_hooks_windows.ps1
 powershell -ExecutionPolicy Bypass -File windows\uninstall_claude_hooks_windows.ps1
 ```
 
-> ⚠️ **Upgrade note:** If you installed hooks before v0.8.0, re-run the install script to add the two new hooks: `PermissionRequest` and `PermissionDenied`. Run `agentwatch doctor` — it should show `Claude hooks: Installed` (6/6).
+> ⚠️ **Session reload:** After installing, **start a new session** in each CLI (or reload hooks, e.g. Grok `/hooks` → `r`). Hooks are loaded at session start; an already-open session will not pick them up automatically.
+>
+> ⚠️ **Upgrade note:** If you installed Claude hooks before v0.8.0, re-run install to add `PermissionRequest` / `PermissionDenied`.
 
 ---
 
@@ -429,7 +449,8 @@ open build/AgentWatch.app        # launch
 | Test Push | Send a test notification to verify the link |
 | Persona Theme | Switch between all 6 themes with a checkmark |
 | Recent Events | Last 5 non-info events with icons, timestamps, and notified/logged tags |
-| Hook status | Shows if all 6 hooks are installed; warns if PermissionRequest is missing |
+| Hook status | Per-agent status (Claude / Grok / Codex / Gemini) |
+| Install / Update Hooks | One-click multi-agent hook install (with confirmation) |
 | Approval Timeout Notify | Shows whether PreToolUse timeout push is On or Off |
 | Task boundary | Manage allowed/forbidden paths |
 | Quick access | Open Logs folder, config.json, README |
@@ -464,10 +485,13 @@ Same as macOS menu bar app, plus:
 
 | Command | Description |
 |---------|-------------|
-| `agentwatch doctor` | Full health check (config, Bark, hooks, logs, task) |
+| `agentwatch doctor` | Full health check (config, Bark, multi-agent hooks, logs, task) |
 | `agentwatch monitor` | Live ANSI dashboard (Ctrl+C to exit) |
 | `agentwatch start` | Doctor check → monitor |
 | `agentwatch init` | Create config.json and logs/ directory |
+| `agentwatch hooks install` | Install hooks for Claude / Grok / Codex / Gemini |
+| `agentwatch hooks status` | Show per-agent hook install status |
+| `agentwatch hooks uninstall` | Remove AgentWatch hooks |
 | `agentwatch config bark` | Set Bark key (accepts full URL or bare key) |
 | `agentwatch config show` | Show Bark config (key is redacted) |
 | `agentwatch config test` | Send a test notification |
@@ -492,7 +516,7 @@ After setup, verify everything works:
 ```bash
 # 1. Health check
 agentwatch doctor
-# Expected: Status: Ready, Claude hooks: Installed
+# Expected: Status: Ready; hooks Installed for each detected agent
 
 # 2. Test notification chain
 agentwatch config test
