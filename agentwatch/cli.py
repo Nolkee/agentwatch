@@ -158,6 +158,22 @@ def cmd_test_push() -> None:
         raise SystemExit(1)
 
 
+def _running_under_grok() -> bool:
+    """True when this process was spawned as a Grok Build lifecycle hook.
+
+    Grok also scans ~/.claude/settings.json for Claude-compatible hooks, so the
+    same Stop event would otherwise fire both --agent claude and --agent grok
+    and push two Bark notifications.
+    """
+    env = os.environ
+    return bool(
+        env.get("GROK_SESSION_ID")
+        or env.get("GROK_HOOK_EVENT")
+        or env.get("GROK_HOOK_NAME")
+        or env.get("GROK_WORKSPACE_ROOT")
+    )
+
+
 def cmd_hook(event_name: str, agent: str = "claude") -> None:
     """Multi-agent hook entry point (Claude / Grok / Codex / Gemini).
 
@@ -169,10 +185,36 @@ def cmd_hook(event_name: str, agent: str = "claude") -> None:
     PostToolUse: clears matching pending actions.
     """
     try:
-        from agentwatch.agents import agent_display, normalize_event_name
+        from agentwatch.agents import agent_display, grok_status, normalize_event_name
 
         agent = (agent or "claude").lower()
         canonical = normalize_event_name(event_name)
+
+        # Grok loads both ~/.grok/hooks and ~/.claude/settings.json. When the
+        # dedicated Grok hooks are installed, ignore the Claude-compat copy so
+        # the user only gets one [Grok] notification per event.
+        if agent == "claude" and _running_under_grok():
+            try:
+                grok_installed = bool(grok_status().get("installed"))
+            except Exception:
+                grok_installed = False
+            if grok_installed:
+                if canonical in (
+                    "Stop",
+                    "Notification",
+                    "PermissionRequest",
+                    "PermissionDenied",
+                    "SessionEnd",
+                ):
+                    print(
+                        "[AgentWatch] Skip Claude-compat hook under Grok "
+                        "(native Grok hooks already handle this event).",
+                        flush=True,
+                    )
+                raise SystemExit(0)
+            # Only Claude hooks installed: keep handling, but label as Grok.
+            agent = "grok"
+
         raw = read_stdin_json()
         parsed = parse_event(raw, canonical, agent=agent)
         category = classify(parsed)

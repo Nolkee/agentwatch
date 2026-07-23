@@ -358,6 +358,8 @@ powershell -ExecutionPolicy Bypass -File windows\uninstall_claude_hooks_windows.
 
 > ⚠️ **Session reload:** After installing, **start a new session** in each CLI (or reload hooks, e.g. Grok `/hooks` → `r`). Hooks are loaded at session start; an already-open session will not pick them up automatically.
 >
+> ⚠️ **Grok + Claude double hooks:** Grok also reads `~/.claude/settings.json`. AgentWatch skips the Claude-compat copy when Grok-native hooks are installed, so you only get one `[Grok]` push per event.
+>
 > ⚠️ **Upgrade note:** If you installed Claude hooks before v0.8.0, re-run install to add `PermissionRequest` / `PermissionDenied`.
 
 ---

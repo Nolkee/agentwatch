@@ -363,6 +363,8 @@ powershell -ExecutionPolicy Bypass -File windows\uninstall_claude_hooks_windows.
 
 > ⚠️ **会话重载：** 安装后请在**每个 CLI 新开会话**（或重载 hooks，例如 Grok 的 `/hooks` → 按 `r`）。Hooks 在 session 启动时加载，已打开的旧会话不会自动生效。
 >
+> ⚠️ **Grok + Claude 双 hooks：** Grok 也会读取 `~/.claude/settings.json`。当已安装 Grok 原生 hooks 时，AgentWatch 会跳过 Claude 兼容副本，避免同一事件推送两条（`[Claude]` + `[Grok]`）。
+>
 > ⚠️ **升级提醒：** 若在 v0.8.0 之前装过 Claude hooks，请重新安装以加入 `PermissionRequest` / `PermissionDenied`。
 
 ---
