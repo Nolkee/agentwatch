@@ -248,15 +248,11 @@ def _should_suppress_duplicate_push(
                 t = t.split("]", 1)[1].strip()
             return t
 
-        last_title = str(last.get("title") or "")
         # Same agent re-fire (Stop + SessionEnd, or hook delivered twice).
         if last_agent and agent and last_agent == agent:
             return True
-        # Claude-compat + Grok native dual path.
-        if {last_agent, agent} <= {"claude", "grok"} and len({last_agent, agent}) == 2:
-            return True
-        # Same card text after stripping [Agent] prefix.
-        if _strip(last_title) == _strip(title) and _strip(title):
+        # Claude-compat + Grok native dual path only (not Claude↔Gemini etc.).
+        if {last_agent, agent} == {"claude", "grok"}:
             return True
         return False
     except Exception:
