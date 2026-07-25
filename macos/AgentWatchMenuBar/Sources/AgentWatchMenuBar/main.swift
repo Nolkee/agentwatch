@@ -365,6 +365,60 @@ func readMultiAgentHookStatus() -> [AgentHookStatus] {
     return result
 }
 
+/// Collect agentwatch hook command strings from a Claude-style hooks object.
+private func collectAgentWatchCommands(from hooks: [String: Any]?) -> [String] {
+    guard let hooks = hooks else { return [] }
+    var cmds: [String] = []
+    for (_, value) in hooks {
+        guard let groups = value as? [[String: Any]] else { continue }
+        for g in groups {
+            guard let inner = g["hooks"] as? [[String: Any]] else { continue }
+            for h in inner {
+                if let cmd = h["command"] as? String, cmd.contains("agentwatch") {
+                    cmds.append(cmd)
+                }
+            }
+        }
+    }
+    return cmds
+}
+
+/// True when installed hook commands are stale (wrong project path or missing --agent).
+func hooksCommandsNeedUpdate() -> Bool {
+    let home = NSHomeDirectory()
+    let expectedPython = "\(kProjectPath)/.venv/bin/python"
+    var commands: [String] = []
+
+    if let settings = readJSON("\(home)/.claude/settings.json") {
+        commands += collectAgentWatchCommands(from: settings["hooks"] as? [String: Any])
+    }
+    if let grok = readJSON("\(home)/.grok/hooks/agentwatch.json") {
+        commands += collectAgentWatchCommands(from: grok["hooks"] as? [String: Any])
+    }
+    if let codex = readJSON("\(home)/.codex/hooks.json") {
+        commands += collectAgentWatchCommands(from: codex["hooks"] as? [String: Any])
+    }
+    if let gemini = readJSON("\(home)/.gemini/settings.json") {
+        commands += collectAgentWatchCommands(from: gemini["hooks"] as? [String: Any])
+    }
+
+    // Nothing registered yet → treat as needs install (caller also checks missing).
+    if commands.isEmpty { return false }
+
+    for cmd in commands {
+        // Prefer this project's venv python when it exists.
+        if FileManager.default.fileExists(atPath: expectedPython),
+           !cmd.contains(expectedPython) {
+            return true
+        }
+        // Multi-agent installs always pass --agent <id>.
+        if !cmd.contains("--agent ") {
+            return true
+        }
+    }
+    return false
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // App Delegate
 // ──────────────────────────────────────────────────────────────────────────────
@@ -380,6 +434,85 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .bold)
 
         rebuildMenu()
+        // Auto-detect missing/stale multi-agent hooks and install/update without a prompt.
+        ensureHooksOnLaunch()
+    }
+
+    /// On launch: if any detected agent is missing hooks, or installed commands
+    /// point at a stale python path / lack `--agent`, run `agentwatch hooks install`.
+    private func ensureHooksOnLaunch() {
+        DispatchQueue.global().async { [weak self] in
+            let before = readAppStatus()
+            let available = before.agentHooks.filter { $0.available }
+            guard !available.isEmpty else { return }
+
+            let missing = available.contains { !$0.installed }
+            let stale = hooksCommandsNeedUpdate()
+            guard missing || stale else {
+                DispatchQueue.main.async {
+                    // Quiet success — only refresh icon/status.
+                    self?.refreshUI(with: "Last: Hooks OK (\(before.hooksSummary))")
+                }
+                return
+            }
+
+            let reason = missing ? "missing" : "stale path/flags"
+            DispatchQueue.main.async {
+                self?.lastActionResult = "Auto-installing hooks (\(reason))..."
+                self?.rebuildMenu()
+            }
+
+            let result = callAgentWatch(["hooks", "install"], timeoutSec: 60.0)
+            let after = readAppStatus()
+            let ok = (result?.exitCode == 0)
+
+            DispatchQueue.main.async {
+                if ok && after.hooksInstalled {
+                    let lines = after.agentHooks
+                        .filter { $0.available }
+                        .map { "\($0.display): \($0.installed ? "✓" : "✗") \($0.hookCount)/\($0.required)" }
+                        .joined(separator: "\n")
+                    self?.showInfoDialog(
+                        "Hooks Auto-Updated",
+                        message: """
+                        AgentWatch detected \(reason) hooks and installed/updated them.
+
+                        \(after.hooksSummary)
+
+                        \(lines)
+
+                        Restart each CLI session (or Grok /hooks → r) so new hooks load.
+                        """
+                    )
+                    self?.refreshUI(with: "Last: Hooks auto-updated ✓")
+                } else if ok {
+                    self?.showInfoDialog(
+                        "Hooks Partially Updated",
+                        message: """
+                        Install finished but some agents are still incomplete:
+
+                        \(after.hooksSummary)
+
+                        Use menu → Install / Update Hooks, or:
+                        agentwatch hooks install
+                        """
+                    )
+                    self?.refreshUI(with: "Last: Hooks auto-update partial")
+                } else {
+                    let err = [result?.stdout, result?.stderr]
+                        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .filter { !$0.isEmpty }
+                        .joined(separator: "\n")
+                    self?.showInfoDialog(
+                        "Hooks Auto-Install Failed",
+                        message: err.isEmpty
+                            ? "Could not run agentwatch hooks install (exit \(result?.exitCode ?? -1))."
+                            : err
+                    )
+                    self?.refreshUI(with: "Last: Hooks auto-install failed ✗")
+                }
+            }
+        }
     }
 
     // ── Menu building ────────────────────────────────────────────────────
@@ -595,12 +728,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: "Install All")
         alert.addButton(withTitle: "Cancel")
         if alert.runModal() != .alertFirstButtonReturn { return }
+        runHooksInstall(showDialog: true, resultPrefix: "Last: Multi-agent hooks")
+    }
 
+    /// Shared installer used by the menu action and launch-time auto-update.
+    private func runHooksInstall(showDialog: Bool, resultPrefix: String) {
         lastActionResult = "Installing multi-agent hooks..."
         rebuildMenu()
 
         DispatchQueue.global().async { [weak self] in
-            // Prefer unified CLI installer (Claude + Grok + Codex + Gemini).
             let result = callAgentWatch(["hooks", "install"], timeoutSec: 60.0)
             DispatchQueue.main.async {
                 let ok = (result?.exitCode == 0)
@@ -614,17 +750,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         .filter { $0.available }
                         .map { "\($0.display): \($0.installed ? "✓" : "✗") \($0.hookCount)/\($0.required)" }
                         .joined(separator: "\n")
-                    self?.showInfoDialog(
-                        "Hooks Updated",
-                        message: "\(status.hooksSummary)\n\n\(lines)\n\nRestart each CLI session to load hooks."
-                    )
+                    if showDialog {
+                        self?.showInfoDialog(
+                            "Hooks Updated",
+                            message: "\(status.hooksSummary)\n\n\(lines)\n\nRestart each CLI session to load hooks."
+                        )
+                    }
                     self?.refreshUI(with: status.hooksInstalled
-                        ? "Last: Multi-agent hooks installed ✓"
-                        : "Last: Hooks install finished — some agents incomplete")
+                        ? "\(resultPrefix) installed ✓"
+                        : "\(resultPrefix) finished — some agents incomplete")
                 } else {
                     let detail = combined.isEmpty ? "Unknown error (exit \(result?.exitCode ?? -1))" : combined
-                    self?.showInfoDialog("Hooks Install Failed", message: detail)
-                    self?.refreshUI(with: "Last: Hooks install failed ✗")
+                    if showDialog {
+                        self?.showInfoDialog("Hooks Install Failed", message: detail)
+                    }
+                    self?.refreshUI(with: "\(resultPrefix) failed ✗")
                 }
             }
         }

@@ -453,6 +453,7 @@ open build/AgentWatch.app        # launch
 | Recent Events | Last 5 non-info events with icons, timestamps, and notified/logged tags |
 | Hook status | Per-agent status (Claude / Grok / Codex / Gemini) |
 | Install / Update Hooks | One-click multi-agent hook install (with confirmation) |
+| Auto hooks on launch | Detects missing/stale hooks and runs `hooks install` automatically |
 | Approval Timeout Notify | Shows whether PreToolUse timeout push is On or Off |
 | Task boundary | Manage allowed/forbidden paths |
 | Quick access | Open Logs folder, config.json, README |

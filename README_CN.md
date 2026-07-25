@@ -458,6 +458,7 @@ open build/AgentWatch.app        # 启动
 | Recent Events | 最近 5 条非 info 事件，带图标、时间和 notified/logged 标签 |
 | Hook 状态 | 按 Agent 显示（Claude / Grok / Codex / Gemini） |
 | Install / Update Hooks | 一键安装多 Agent hooks（带确认） |
+| 启动时自动 hooks | 检测缺失/过期 hooks 并自动执行 `hooks install` |
 | Approval Timeout Notify | 显示 PreToolUse timeout 推送是否开启 |
 | 任务边界 | 管理允许/禁止路径 |
 | 快捷入口 | 打开 Logs 文件夹、config.json、README |
